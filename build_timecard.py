@@ -228,8 +228,10 @@ def build_template(ws):
             ws.cell(r, dst, "=" + to_serial(f"${get_column_letter(src)}{r}"))
         ws.cell(r, C_DAILY_WORK,
                 f'=IF(OR($N{r}="",$O{r}=""),"",MOD($O{r}-$N{r},1))')
+        # 祝日かどうかは K列の文字(手入力で書き換えられうる)ではなく、
+        # 祝日リストを直接参照して判定する
         ws.cell(r, C_KIND,
-                f'=IF($A{r}="","",IF($K{r}<>"","祝",'
+                f'=IF($A{r}="","",IF(ISNUMBER(MATCH($A{r},祝日リスト!$A$2:$A$40,0)),"祝",'
                 f'IF(WEEKDAY($A{r},2)=6,"土",IF(WEEKDAY($A{r},2)=7,"日","平"))))')
         for c in range(C_KIND + 1, 30):         # 作業列より右の残骸を掃除
             ws.cell(r, c).value = None
@@ -275,13 +277,14 @@ def apply_dv_and_print(ws, anchor, last, s):
         ws.column_dimensions[get_column_letter(c)].hidden = True
     ws.print_area = f"A1:K{s + 3}"
 
-    # 土日・水曜・祝日の行を同じ色で塗る
+    # 土日・水曜・祝日の行を同じ色で塗る。祝日かどうかは K列の文字(手入力で
+    # 書き換えられうる)ではなく、祝日リストを直接参照して判定する
     ws.conditional_formatting.add(
         f"A{anchor}:K{last}",
         FormulaRule(
             formula=[f'AND($A{anchor}<>"",OR(WEEKDAY($A{anchor},2)=6,'
                      f'WEEKDAY($A{anchor},2)=7,WEEKDAY($A{anchor},2)=3,'
-                     f'$K{anchor}<>""))'],
+                     f'ISNUMBER(MATCH($A{anchor},祝日リスト!$A$2:$A$40,0))))'],
             fill=HOLIDAY_FILL))
 
 
