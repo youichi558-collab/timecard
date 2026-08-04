@@ -23,9 +23,20 @@ ROW_LAST = ROW_FIRST + 30  # 38 = 31日目
 COL = {
     "date": 1, "dow": 2, "in": 3, "out": 4, "brk": 5, "work": 6,
     "ot": 7, "ot_night": 8, "ot_early": 9, "late": 10,
-    "holiday": 11, "note": 12, "kind": 13,  # M列は判定用の隠し列
+    "holiday": 11, "note": 12,
+    # M列以降は非表示の作業列。区分の判定と、時刻入力のシリアル値変換に使う。
+    "kind": 13,
+    "_in": 14, "_out": 15, "_brk": 16,
+    "_ot": 17, "_ot_night": 18, "_ot_early": 19, "_late": 20,
 }
+HIDDEN_FIRST, HIDDEN_LAST = 13, 20
 LAST_COL = 12  # 印刷対象はL列まで
+
+# 時刻入力欄の表示形式。930 という数値を 09:30 と表示する。
+# 日付/時刻書式ではなく数値書式にしておくことが重要で、こうしておくと
+# 930 が日付シリアル値と解釈されない。コロン付きで 9:30 と入力した場合は
+# Excel 側が時刻値として取り込み、そのセルの書式を h:mm に置き換える。
+TIME_FMT = '00":"00'
 
 FONT = "Meiryo UI"
 
@@ -67,6 +78,21 @@ med = Side(style="medium", color="FF1F3864")
 
 def box(left=thin, right=thin, top=thin, bottom=thin):
     return Border(left=left, right=right, top=top, bottom=bottom)
+
+
+def hhmm(t):
+    """datetime.time を、この帳簿の入力形式である HHMM の整数にする。"""
+    return t.hour * 100 + t.minute
+
+
+def to_serial(ref):
+    """時刻入力欄をシリアル値(1日=1)に変換する数式を返す。
+
+    コロンなしで 930 と入れた場合は 9時30分、コロン付きで 9:30 と入れた場合は
+    Excel が時刻値(1未満)として持つのでそのまま使う。どちらの打ち方でも通る。
+    """
+    return (f'IF(NOT(ISNUMBER({ref})),"",'
+            f'IF({ref}<1,{ref},(INT({ref}/100)*60+MOD({ref},100))/1440))')
 
 
 HOLIDAY_NAMES = {name for _, name, _ in HOLIDAYS_2026}
@@ -144,9 +170,9 @@ def build_settings(wb, name=""):
         ("年", YEAR, "この年を全シートの日付・祝日判定に使います"),
         ("氏名", name, "各月シートの氏名欄に自動反映されます"),
         ("所属", "", "各月シートの所属欄に自動反映されます"),
-        ("所定労働時間/日", datetime.time(8, 0), "1日の所定時間。超過分が「所定超過」に出ます"),
-        ("休憩時間(既定)", datetime.time(1, 0), "休憩欄が空のとき、この時間を自動で差し引きます"),
-        ("休憩を差し引く最低勤務時間", datetime.time(6, 0), "この時間を超えたときだけ既定休憩を引きます"),
+        ("所定労働時間/日", 800, "1日の所定時間。超過分が「所定超過」に出ます"),
+        ("休憩時間(既定)", 100, "休憩欄が空のとき、この時間を自動で差し引きます"),
+        ("休憩を差し引く最低勤務時間", 600, "この時間を超えたときだけ既定休憩を引きます"),
     ]
     for i, (label, val, memo) in enumerate(rows, start=3):
         ws.cell(i, 1, label).font = Font(name=FONT, sz=11, b=True)
@@ -157,15 +183,20 @@ def build_settings(wb, name=""):
         c.fill = PatternFill("solid", fgColor=C_INPUT)
         c.border = box()
         c.alignment = Alignment(horizontal="center")
-        if isinstance(val, datetime.time):
-            c.number_format = "h:mm"
+        if i >= 6:  # 時間の設定欄。月シートと同じくコロンなしで入力できる
+            c.number_format = TIME_FMT
+            ws.cell(i, 5, "=" + to_serial(f"$B${i}"))
         ws.cell(i, 3, memo).font = Font(name=FONT, sz=9, color="FF666666")
+    ws.column_dimensions["E"].hidden = True  # 月シートが参照する変換後の値
 
     ws["A11"] = "使い方"
     ws["A11"].font = Font(name=FONT, sz=12, b=True, color=C_HEAD)
     tips = [
         "1. まずこの設定シートで「氏名」「所属」「所定労働時間」を入力してください。",
         "2. 各月シートは、黄色いセル（出勤・退勤・休憩・残業・備考）だけ入力します。",
+        "   時刻はコロンなしで入力できます。930 と打てば 09:30、1615 と打てば 16:15 になります。",
+        "   9:30 のようにコロン付きで入力しても構いません。どちらでも正しく計算されます。",
+        "   30分だけの休憩は 30、1時間なら 100 と入力します（HHMM形式のため）。",
         "3. 出勤と退勤を入れると「実働」が自動計算されます。日をまたぐ勤務にも対応しています。",
         "4. 休憩を空欄にすると、設定シートの既定休憩が自動で差し引かれます。個別に変えたい日は直接入力してください。",
         "5. 土曜は青、日曜・祝日はピンクで色分けされます。祝日名はK列に自動表示されます。",
@@ -248,7 +279,7 @@ def build_month(wb, month, recs):
         ws[a].alignment = Alignment(horizontal="center")
         ws[a].border = Border(bottom=Side(style="thin"))
 
-    ws["A5"] = "黄色のセルに入力してください（灰色は自動計算）"
+    ws["A5"] = "黄色のセルに入力してください（灰色は自動計算）。時刻は 930 のようにコロンなしで入力できます。"
     ws["A5"].font = Font(name=FONT, sz=9, color="FF888888")
 
     # --- 見出し ---
@@ -264,7 +295,8 @@ def build_month(wb, month, recs):
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         c.border = Border(left=thin, right=thin, top=med, bottom=med)
         ws.column_dimensions[get_column_letter(i)].width = w
-    ws.column_dimensions["M"].hidden = True
+    for i in range(HIDDEN_FIRST, HIDDEN_LAST + 1):
+        ws.column_dimensions[get_column_letter(i)].hidden = True
     ws.row_dimensions[ROW_HEAD].height = 26
 
     input_cols = {"in", "out", "brk", "ot", "ot_night", "ot_early", "late", "note"}
@@ -280,12 +312,16 @@ def build_month(wb, month, recs):
                     f'=IF(A{prev}="","",IF(MONTH(A{prev}+1)=$D$4,A{prev}+1,""))')
         ws.cell(r, COL["dow"],
                 f'=IF($A{r}="","",CHOOSE(WEEKDAY($A{r},2),"月","火","水","木","金","土","日"))')
+        # N〜T列: 入力欄をシリアル値に変換した作業列(非表示)
+        for key in ("in", "out", "brk", "ot", "ot_night", "ot_early", "late"):
+            src = f"${get_column_letter(COL[key])}{r}"
+            ws.cell(r, COL["_" + key], "=" + to_serial(src))
         # 実働 = 退勤 - 出勤 (日跨ぎ対応) - 休憩(未入力なら既定休憩)
         ws.cell(r, COL["work"],
-                f'=IF(NOT(AND(ISNUMBER($C{r}),ISNUMBER($D{r}))),"",'
-                f'MAX(0,MOD($D{r}-$C{r},1)'
-                f'-IF(ISNUMBER($E{r}),$E{r},'
-                f'IF(MOD($D{r}-$C{r},1)>設定!$B$8,設定!$B$7,0))))')
+                f'=IF(OR($N{r}="",$O{r}=""),"",'
+                f'MAX(0,MOD($O{r}-$N{r},1)'
+                f'-IF($P{r}<>"",$P{r},'
+                f'IF(MOD($O{r}-$N{r},1)>設定!$E$8,設定!$E$7,0))))')
         ws.cell(r, COL["holiday"],
                 f'=IF($A{r}="","",IFERROR(VLOOKUP($A{r},祝日リスト!$A$2:$C$40,3,0),""))')
         # M列: 日区分(平日/土/日/祝) — 集計とCFの判定用
@@ -299,7 +335,7 @@ def build_month(wb, month, recs):
             c.border = box()
             c.alignment = Alignment(horizontal="center", vertical="center")
             if key in ("in", "out", "brk", "ot", "ot_night", "ot_early", "late"):
-                c.number_format = "h:mm"
+                c.number_format = TIME_FMT
             if key == "work":
                 c.number_format = "[h]:mm"
             if key == "date":
@@ -311,7 +347,7 @@ def build_month(wb, month, recs):
                 c.font = Font(name=FONT, sz=9, color="FFC00000")
             if key in input_cols:
                 c.fill = PatternFill("solid", fgColor=C_INPUT)
-            elif key != "kind":
+            elif col < HIDDEN_FIRST:
                 c.fill = PatternFill("solid", fgColor=C_CALC)
         ws.cell(r, COL["date"]).border = Border(left=med, right=thin, top=thin, bottom=thin)
         ws.cell(r, LAST_COL).border = Border(left=thin, right=med, top=thin, bottom=thin)
@@ -321,14 +357,14 @@ def build_month(wb, month, recs):
         rec = recs.get(day)
         if rec:
             if rec["in"]:
-                ws.cell(r, COL["in"], rec["in"])
+                ws.cell(r, COL["in"], hhmm(rec["in"]))
             if rec["out"]:
-                ws.cell(r, COL["out"], rec["out"])
+                ws.cell(r, COL["out"], hhmm(rec["out"]))
             if rec["note"]:
                 ws.cell(r, COL["note"], rec["note"])
             for k, v in zip(("ot", "ot_night", "ot_early", "late"), rec["ot"]):
                 if v:
-                    ws.cell(r, COL[k], v)
+                    ws.cell(r, COL[k], hhmm(v))
 
     # 明細の下辺
     for i in range(1, LAST_COL + 1):
@@ -353,9 +389,9 @@ def build_month(wb, month, recs):
         fill=PatternFill("solid", start_color="FFFFC7CE", end_color="FFFFC7CE"),
         font=Font(name=FONT, sz=11, color="FF9C0006"))
     ws.conditional_formatting.add(f"D{ROW_FIRST}:D{ROW_LAST}", FormulaRule(
-        formula=[f'AND($C{ROW_FIRST}<>"",$D{ROW_FIRST}="")'], **alert))
+        formula=[f'AND($N{ROW_FIRST}<>"",$O{ROW_FIRST}="")'], **alert))
     ws.conditional_formatting.add(f"C{ROW_FIRST}:C{ROW_LAST}", FormulaRule(
-        formula=[f'AND($D{ROW_FIRST}<>"",$C{ROW_FIRST}="")'], **alert))
+        formula=[f'AND($O{ROW_FIRST}<>"",$N{ROW_FIRST}="")'], **alert))
 
     # --- 入力補助 ---
     dv = DataValidation(
@@ -367,11 +403,17 @@ def build_month(wb, month, recs):
     ws.add_data_validation(dv)
     dv.add(f"L{ROW_FIRST}:L{ROW_LAST}")
 
-    dvt = DataValidation(type="time", operator="between",
-                         formula1="0", formula2="1",
-                         allow_blank=True, showErrorMessage=True)
-    dvt.error = "時刻を h:mm 形式で入力してください（例 9:30）"
-    dvt.errorTitle = "入力形式"
+    dvt = DataValidation(
+        type="custom", allow_blank=True, showErrorMessage=True,
+        formula1=f'=OR(AND(C{ROW_FIRST}>=0,C{ROW_FIRST}<1),'
+                 f'AND(C{ROW_FIRST}=INT(C{ROW_FIRST}),C{ROW_FIRST}<=2359,'
+                 f'MOD(C{ROW_FIRST},100)<60))')
+    dvt.error = ("コロンなしで 930（＝9時30分）のように入力してください。"
+                 "9:30 のようにコロン付きでも入力できます。")
+    dvt.errorTitle = "時刻の入力"
+    dvt.prompt = "930 と入力すれば 09:30 になります"
+    dvt.promptTitle = "時刻の入力"
+    dvt.showInputMessage = True
     ws.add_data_validation(dvt)
     for col in ("C", "D", "E", "G", "H", "I", "J"):
         dvt.add(f"{col}{ROW_FIRST}:{col}{ROW_LAST}")
@@ -386,19 +428,19 @@ def build_month(wb, month, recs):
     ws.row_dimensions[top].height = 20
 
     left = [
-        ("出勤日数", f'=COUNT($C${ROW_FIRST}:$C${ROW_LAST})', "日", "0"),
+        ("出勤日数", f'=COUNT($N${ROW_FIRST}:$N${ROW_LAST})', "日", "0"),
         ("実働時間 合計", f"=SUM({F})", "", "[h]:mm"),
         ("　うち 平日", f'=SUMIF({M},"平",{F})', "", "[h]:mm"),
         ("　うち 土曜", f'=SUMIF({M},"土",{F})', "", "[h]:mm"),
         ("　うち 日曜・祝日", f'=SUMIF({M},"日",{F})+SUMIF({M},"祝",{F})', "", "[h]:mm"),
     ]
     right = [
-        ("通常残業", f"=SUM($G${ROW_FIRST}:$G${ROW_LAST})", "[h]:mm"),
-        ("深夜残業", f"=SUM($H${ROW_FIRST}:$H${ROW_LAST})", "[h]:mm"),
-        ("早朝残業", f"=SUM($I${ROW_FIRST}:$I${ROW_LAST})", "[h]:mm"),
-        ("遅刻・早退", f"=SUM($J${ROW_FIRST}:$J${ROW_LAST})", "[h]:mm"),
+        ("通常残業", f"=SUM($Q${ROW_FIRST}:$Q${ROW_LAST})", "[h]:mm"),
+        ("深夜残業", f"=SUM($R${ROW_FIRST}:$R${ROW_LAST})", "[h]:mm"),
+        ("早朝残業", f"=SUM($S${ROW_FIRST}:$S${ROW_LAST})", "[h]:mm"),
+        ("遅刻・早退", f"=SUM($T${ROW_FIRST}:$T${ROW_LAST})", "[h]:mm"),
         ("所定超過(実働-所定×出勤日数)",
-         f'=MAX(0,SUM({F})-設定!$B$6*COUNT($C${ROW_FIRST}:$C${ROW_LAST}))', "[h]:mm"),
+         f'=MAX(0,SUM({F})-設定!$E$6*COUNT($N${ROW_FIRST}:$N${ROW_LAST}))', "[h]:mm"),
     ]
 
     def put(row, col_label, col_val, label, formula, fmt, unit=""):
