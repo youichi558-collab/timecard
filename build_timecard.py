@@ -481,7 +481,9 @@ def main():
     wb._sheets = [sheets[m] for m in range(1, 13)] + [holiday_ws]
 
     wb.save(DST)
-    inject_cache(DST)
+    # inject_cache(DST)  # 実機Excelでは fullCalcOnLoad により自動再計算されるため
+    # 不要。むしろこの生XMLパッチが原因で条件付き書式が読み込まれない不具合が
+    # 疑われるため、当面は無効化して切り分ける。
     print(f"saved {DST}: {wb.sheetnames}")
 
 
