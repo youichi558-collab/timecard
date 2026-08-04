@@ -374,6 +374,11 @@ def main():
     holiday_ws = wb["祝日リスト"]
     wb._sheets = [sheets[m] for m in range(1, 13)] + [holiday_ws]
 
+    # ファイルのプロパティ(作成者)が元のテンプレート作成者のままだったので、
+    # 実際の使用者の名前にそろえる
+    wb.properties.creator = name
+    wb.properties.lastModifiedBy = name
+
     wb.save(DST)
     print(f"saved {DST}: {wb.sheetnames}")
 
