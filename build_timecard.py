@@ -207,8 +207,13 @@ def build_template(ws):
         # 表には出さず、集計だけがここを参照する。
         for src, dst in C_CONV.items():
             ws.cell(r, dst, "=" + to_serial(f"${get_column_letter(src)}{r}"))
+        # 実働 = 退勤-出勤 から、12:00〜13:00と重なった分(最大1時間)を自動で引く。
+        # 12:00=0.5, 13:00=13/24 は日付/時刻トークンを使わない単純な小数として
+        # 埋め込んでいる(TIME()関数などは使わない)。
         ws.cell(r, C_DAILY_WORK,
-                f'=IF(OR($N{r}="",$O{r}=""),"",MOD($O{r}-$N{r},1))')
+                f'=IF(OR($N{r}="",$O{r}=""),"",'
+                f'MAX(0,MOD($O{r}-$N{r},1)'
+                f'-MAX(0,MIN($O{r},13/24)-MAX($N{r},0.5))))')
         # 祝日かどうかは K列の文字(手入力で書き換えられうる)ではなく、
         # 祝日リストを直接参照して判定する
         ws.cell(r, C_KIND,
