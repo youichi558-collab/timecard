@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """出勤簿ブックの改修スクリプト。
 
-元ブック(出勤簿_2026_original.xlsx)を「その場で」書き換える。作り直すのではなく
-元ファイルを開いて必要な箇所だけ直すので、見出し・列幅・フォント・罫線といった
-見た目は元のまま変わらない。
+元ブック(出勤簿_2026_original.xlsx)の12シートは、体裁が微妙に揃っていなかった
+(4月だけ明細の開始行が2行ずれている、見出しの文言が違う、など)。個別に直すのでは
+なく、1月シートだけを土台として体裁を整え、それを11か月ぶん複製することで、
+12シートの体裁を完全にそろえる。データ(出勤・退勤・理由など)は複製後にシートごと
+入れ直す。
 
 直すのは中身だけ:
   - 祝日リストを2025年から2026年に差し替え、VLOOKUPの参照範囲の取りこぼしを修正
@@ -166,72 +168,53 @@ def fix_holidays(wb):
     return len(HOLIDAYS_2026)
 
 
-def fix_month(ws, name):
+HOLIDAY_DATES = {datetime.date(YEAR, m, d): nm for (m, d), nm, _ in HOLIDAYS_2026}
+
+
+def extract_month_records(ws, anchor, ndays):
+    """既存シートから、その月に入力済みの勤務データを読み取る。
+
+    12シートは元々レイアウトが揃っていなかった(4月だけ開始行が2行ずれている等)
+    ため、複製前のこの段階で「anchorはシートごとに検出する」必要がある。
+    """
+    records = {}
+    for day in range(1, ndays + 1):
+        r = anchor + day - 1
+        vals, bad = {}, []
+        for c in (C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE):
+            v = ws.cell(r, c).value
+            if isinstance(v, datetime.time):
+                vals[c] = hhmm(v)
+            elif isinstance(v, (int, float)):
+                vals[c] = int(v)
+            elif isinstance(v, str) and v.strip() and v.strip() not in JUNK:
+                bad.append((c, v.strip()))
+        k = ws.cell(r, C_REASON).value
+        note = None
+        if (isinstance(k, str) and not k.startswith("=") and k.strip()
+                and k.strip() not in JUNK and k.strip() not in HOLIDAY_NAMES):
+            note = k.strip()
+        if vals or bad or note:
+            records[day] = {"vals": vals, "bad": bad, "note": note}
+    return records
+
+
+def build_template(ws):
+    """1つのシートを土台として体裁を整える(数式・入力規則・印刷設定など)。
+
+    この関数の結果を他の11か月へ複製することで、12シートの体裁を完全に
+    そろえる。データ(出勤・退勤・理由など)はここでは触らない。
+    """
     anchor = find_anchor(ws)
     last = anchor + 30
-    month = int(ws.title[:-1])
-    ndays = days_in_month(month)
-    holidays = {datetime.date(YEAR, m, d): nm for (m, d), nm, _ in HOLIDAYS_2026}
-    salvaged = []
-    count_in = 0
-    work_sum = sat_work_sum = ot_sum = 0.0
-
-    # --- 氏名。元ブックでは月ごとに手入力で、未記入や㊞のままの月があった ---
-    if ws.cell(2, C_REASON).value in (None, "", "㊞"):
-        ws.cell(2, C_REASON, name)
-
-    # --- 見出し。4月だけ K列が「休憩時間」になっていたので他の月にそろえる ---
-    head = anchor - 1
-    if ws.cell(head, C_REASON).value != "理由":
-        ws.cell(head, C_REASON, "理由")
+    ws.cell(anchor - 1, C_REASON, "理由")
 
     for r in range(anchor, last + 1):
-        day = r - anchor + 1
-        date_val = datetime.date(YEAR, month, day) if day <= ndays else None
-
-        # 曜日欄。4月の1日目だけ数式でなく文字が直接入っていた。
-        # ロケール非依存の CHOOSE(WEEKDAY()) にして、TEXT(...,"aaa") が環境の
-        # 言語設定で英語表記になってしまう問題も合わせて防ぐ。
+        # 曜日欄。ロケール非依存の CHOOSE(WEEKDAY()) にする
+        # (TEXT(...,"aaa") だと、開いた環境の言語設定で英語表記になりうる)
         ws.cell(r, 3,
                 f'=IF(A{r}="","","("&'
                 f'CHOOSE(WEEKDAY(A{r},2),"月","火","水","木","金","土","日")&"）")')
-        cache(ws, f"A{r}", to_excel(date_val) if date_val else None)
-        if date_val:
-            cache(ws, f"C{r}", f"({WEEKDAY_JA[date_val.weekday()]}）")
-
-        # 入力欄。時刻値は HHMM の数値に直し、「：」などの飾り文字は消す
-        vals = {}
-        for c in (C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE):
-            cell = ws.cell(r, c)
-            v = cell.value
-            if isinstance(v, datetime.time):
-                v = hhmm(v)
-                cell.value = v
-            elif v is not None:
-                if isinstance(v, str) and v.strip() and v.strip() not in JUNK:
-                    salvaged.append((day, cell.coordinate,
-                                     f"{COL_LABEL[c]}「{v.strip()}」"))
-                v = None
-                cell.value = None
-            cell.number_format = TIME_FMT
-            vals[c] = v
-
-        # 理由欄。祝日名は自動表示に戻し、手書きのメモはそのまま残す
-        k = ws.cell(r, C_REASON)
-        keep = (isinstance(k.value, str) and k.value.strip()
-                and not k.value.startswith("=")
-                and k.value.strip() not in HOLIDAY_NAMES)
-        row_bad = [s for d, _, s in salvaged if d == day]
-        holiday_name = holidays.get(date_val)
-        if row_bad:
-            # 時刻として読めなかった入力は消したままにせず、理由欄に退避する
-            flag = "要確認: " + "・".join(row_bad)
-            k.value = f"{k.value} / {flag}" if keep else flag
-        elif not keep:
-            k.value = (f'=IF($A{r}="","",'
-                       f'IFERROR(VLOOKUP($A{r},祝日リスト!$A$2:$C$40,3,0),""))')
-            cache(ws, f"K{r}", holiday_name)
-
         # 非表示の作業列。入力値のシリアル値変換、日ごとの実働、曜日区分。
         # 表には出さず、集計だけがここを参照する。
         for src, dst in C_CONV.items():
@@ -244,20 +227,6 @@ def fix_month(ws, name):
         for c in range(C_KIND + 1, 30):         # 作業列より右の残骸を掃除
             ws.cell(r, c).value = None
 
-        # 集計欄のキャッシュ値を作るため、この行の実働・残業を集計しておく
-        in_f, out_f = frac(vals[C_IN]), frac(vals[C_OUT])
-        work_f = None if in_f is None or out_f is None else (out_f - in_f) % 1
-        if date_val and vals[C_IN] is not None:
-            count_in += 1
-        if work_f is not None:
-            work_sum += work_f
-            if date_val and holiday_name is None and date_val.weekday() == 5:
-                sat_work_sum += work_f
-        for c in (C_OT, C_OT_N, C_OT_E):
-            fv = frac(vals[c])
-            if fv is not None:
-                ot_sum += fv
-
     # --- 集計。行の位置と見出しは元のまま、式だけ実績ベースに直す ---
     s = find_row(ws, 3, "出勤日数")
     work = f"$T${anchor}:$T${last}"
@@ -265,21 +234,22 @@ def fix_month(ws, name):
     for i in range(1, 4):                        # 元は空欄だった行の書式をそろえる
         copy_style(ws.cell(s + i, 4), ws.cell(s, 4))
     ws.cell(s, 4, f"=COUNT($N${anchor}:$N${last})").number_format = "0"
-    cache(ws, ws.cell(s, 4).coordinate, count_in)
     ws.cell(s + 1, 4, f'=SUM({work})-SUMIF({kind},"土",{work})')
-    cache(ws, ws.cell(s + 1, 4).coordinate, work_sum - sat_work_sum)
     ws.cell(s + 2, 4,
             f"=SUM($P${anchor}:$P${last})+SUM($Q${anchor}:$Q${last})"
             f"+SUM($R${anchor}:$R${last})")
-    cache(ws, ws.cell(s + 2, 4).coordinate, ot_sum)
     ws.cell(s + 3, 4, f'=SUMIF({kind},"土",{work})')
-    cache(ws, ws.cell(s + 3, 4).coordinate, sat_work_sum)
     for i in range(1, 4):
         ws.cell(s + i, 4).number_format = "[h]:mm"
     ws.cell(s + 3, 10, f"=SUM({work})").number_format = "[h]:mm"
-    cache(ws, ws.cell(s + 3, 10).coordinate, work_sum)
 
-    # --- 入力規則。コロンなしとコロン付きの両方を通す ---
+    apply_dv_and_print(ws, anchor, last, s)
+    return anchor, last, s
+
+
+def apply_dv_and_print(ws, anchor, last, s):
+    """入力規則と印刷範囲。copy_worksheet ではコピーされないため、複製後の
+    シートにも毎回かけ直す必要がある(テンプレート自身にも同じ処理でよい)。"""
     dv = DataValidation(
         type="custom", allow_blank=True, showErrorMessage=True,
         formula1=f'=OR(AND(D{anchor}>=0,D{anchor}<1),'
@@ -296,9 +266,76 @@ def fix_month(ws, name):
         col = get_column_letter(c)
         dv.add(f"{col}{anchor}:{col}{last}")
 
-    # --- 表示・印刷。列構成は元のまま。作業列(N〜U)だけ隠す ---
     for c in HIDDEN:
         ws.column_dimensions[get_column_letter(c)].hidden = True
+    ws.print_area = f"A1:K{s + 3}"
+
+
+def populate_month(ws, month, anchor, last, s, records, name):
+    """1つのシートに、その月の実データを書き込む。
+
+    12シートとも build_template で作った同一構造の複製なので、ここでは
+    値を入れるだけでよい(体裁は一切いじらない)。
+    """
+    ws.cell(2, 3, month)
+    ws.cell(2, C_REASON, name)
+
+    ndays = days_in_month(month)
+    salvaged = []
+    count_in = 0
+    work_sum = sat_work_sum = ot_sum = 0.0
+
+    for r in range(anchor, last + 1):
+        day = r - anchor + 1
+        date_val = datetime.date(YEAR, month, day) if day <= ndays else None
+        cache(ws, f"A{r}", to_excel(date_val) if date_val else None)
+        if date_val:
+            cache(ws, f"C{r}", f"({WEEKDAY_JA[date_val.weekday()]}）")
+
+        rec = records.get(day, {})
+        vals = rec.get("vals", {})
+        for c in (C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE):
+            cell = ws.cell(r, c)
+            cell.value = vals.get(c)
+            cell.number_format = TIME_FMT
+        for c, raw in rec.get("bad", []):
+            salvaged.append((day, ws.cell(r, c).coordinate,
+                              f"{COL_LABEL[c]}「{raw}」"))
+
+        note = rec.get("note")
+        row_bad = [x for d, _, x in salvaged if d == day]
+        holiday_name = HOLIDAY_DATES.get(date_val)
+        k = ws.cell(r, C_REASON)
+        if row_bad:
+            # 時刻として読めなかった入力は消したままにせず、理由欄に退避する
+            flag = "要確認: " + "・".join(row_bad)
+            k.value = f"{note} / {flag}" if note else flag
+        elif note:
+            k.value = note
+        else:
+            k.value = (f'=IF($A{r}="","",'
+                       f'IFERROR(VLOOKUP($A{r},祝日リスト!$A$2:$C$40,3,0),""))')
+            cache(ws, k.coordinate, holiday_name)
+
+        # 集計欄のキャッシュ値を作るため、この行の実働・残業を集計しておく
+        in_f, out_f = frac(vals.get(C_IN)), frac(vals.get(C_OUT))
+        work_f = None if in_f is None or out_f is None else (out_f - in_f) % 1
+        if date_val and vals.get(C_IN) is not None:
+            count_in += 1
+        if work_f is not None:
+            work_sum += work_f
+            if date_val and holiday_name is None and date_val.weekday() == 5:
+                sat_work_sum += work_f
+        for c in (C_OT, C_OT_N, C_OT_E):
+            fv = frac(vals.get(c))
+            if fv is not None:
+                ot_sum += fv
+
+    cache(ws, ws.cell(s, 4).coordinate, count_in)
+    cache(ws, ws.cell(s + 1, 4).coordinate, work_sum - sat_work_sum)
+    cache(ws, ws.cell(s + 2, 4).coordinate, ot_sum)
+    cache(ws, ws.cell(s + 3, 4).coordinate, sat_work_sum)
+    cache(ws, ws.cell(s + 3, 10).coordinate, work_sum)
     return salvaged
 
 
@@ -372,6 +409,9 @@ def inject_cache(path):
             zout.writestr(n, data[n])
 
 
+TEMPLATE_MONTH = 1  # このシートの体裁を12か月ぶん複製する
+
+
 def main():
     wb = load_workbook(SRC)
 
@@ -382,12 +422,42 @@ def main():
             name = v
             break
 
+    # 複製・削除する前に、12シート分の実データをそれぞれの元の行位置から
+    # 読み取っておく(4月だけ開始行が2行ずれているなど、シートごとに構造が
+    # 揃っていなかったため)
+    month_records = {}
+    for m in range(1, 13):
+        ws = wb[f"{m}月"]
+        anchor = find_anchor(ws)
+        month_records[m] = extract_month_records(ws, anchor, days_in_month(m))
+
     n = fix_holidays(wb)
     print(f"祝日リスト: {YEAR}年 {n}件に差し替え")
 
+    # 1つのシートだけ体裁を整え、残り11か月はそれを複製して作る。
+    # 個別に直すのではなく複製することで、12シートの体裁を完全にそろえる。
+    template = wb[f"{TEMPLATE_MONTH}月"]
+    anchor, last, s = build_template(template)
+
     for m in range(1, 13):
-        for day, addr, v in fix_month(wb[f"{m}月"], name):
+        if m != TEMPLATE_MONTH:
+            del wb[f"{m}月"]
+
+    sheets = {TEMPLATE_MONTH: template}
+    for m in range(1, 13):
+        if m != TEMPLATE_MONTH:
+            new_ws = wb.copy_worksheet(template)
+            new_ws.title = f"{m}月"
+            apply_dv_and_print(new_ws, anchor, last, s)  # copy_worksheetは引き継がない
+            sheets[m] = new_ws
+
+    for m in range(1, 13):
+        for day, addr, v in populate_month(sheets[m], m, anchor, last, s,
+                                            month_records[m], name):
             print(f"  要確認 {m}月{day}日 {addr} = {v!r}（時刻として読めないため削除）")
+
+    holiday_ws = wb["祝日リスト"]
+    wb._sheets = [sheets[m] for m in range(1, 13)] + [holiday_ws]
 
     wb.save(DST)
     inject_cache(DST)
