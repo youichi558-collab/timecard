@@ -21,9 +21,14 @@ from copy import copy
 from xml.sax.saxutils import escape
 
 from openpyxl import load_workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.datavalidation import DataValidation
+
+# 土日・水曜・祝日をこの色で塗る(休日として同じ色でまとめる)
+HOLIDAY_FILL = PatternFill("solid", fgColor="FFFCE4E4")
 
 # 数式セルの計算結果(キャッシュ値)。{シート名: {セル番地: 値}}
 # openpyxl は数式の文字列だけを保存し、計算済みの値は保存しない。そのため
@@ -248,8 +253,9 @@ def build_template(ws):
 
 
 def apply_dv_and_print(ws, anchor, last, s):
-    """入力規則と印刷範囲。copy_worksheet ではコピーされないため、複製後の
-    シートにも毎回かけ直す必要がある(テンプレート自身にも同じ処理でよい)。"""
+    """入力規則・印刷範囲・行の色分け。copy_worksheet ではどれもコピーされない
+    ため、複製後のシートにも毎回かけ直す必要がある(テンプレート自身にも
+    同じ処理でよい)。"""
     dv = DataValidation(
         type="custom", allow_blank=True, showErrorMessage=True,
         formula1=f'=OR(AND(D{anchor}>=0,D{anchor}<1),'
@@ -269,6 +275,15 @@ def apply_dv_and_print(ws, anchor, last, s):
     for c in HIDDEN:
         ws.column_dimensions[get_column_letter(c)].hidden = True
     ws.print_area = f"A1:K{s + 3}"
+
+    # 土日・水曜・祝日の行を同じ色で塗る
+    ws.conditional_formatting.add(
+        f"A{anchor}:K{last}",
+        FormulaRule(
+            formula=[f'AND($A{anchor}<>"",OR(WEEKDAY($A{anchor},2)=6,'
+                     f'WEEKDAY($A{anchor},2)=7,WEEKDAY($A{anchor},2)=3,'
+                     f'$K{anchor}<>""))'],
+            fill=HOLIDAY_FILL))
 
 
 def populate_month(ws, month, anchor, last, s, records, name):
