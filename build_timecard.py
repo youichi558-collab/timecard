@@ -410,6 +410,7 @@ def inject_cache(path):
 
 
 TEMPLATE_MONTH = 1  # このシートの体裁を12か月ぶん複製する
+HIRE_DATE = datetime.date(2026, 4, 15)  # 入社日。これより前のデータは使わない
 
 
 def main():
@@ -424,12 +425,16 @@ def main():
 
     # 複製・削除する前に、12シート分の実データをそれぞれの元の行位置から
     # 読み取っておく(4月だけ開始行が2行ずれているなど、シートごとに構造が
-    # 揃っていなかったため)
+    # 揃っていなかったため)。入社日(HIRE_DATE)より前のデータは使わない。
     month_records = {}
     for m in range(1, 13):
         ws = wb[f"{m}月"]
         anchor = find_anchor(ws)
-        month_records[m] = extract_month_records(ws, anchor, days_in_month(m))
+        records = extract_month_records(ws, anchor, days_in_month(m))
+        month_records[m] = {
+            day: rec for day, rec in records.items()
+            if datetime.date(YEAR, m, day) >= HIRE_DATE
+        }
 
     n = fix_holidays(wb)
     print(f"祝日リスト: {YEAR}年 {n}件に差し替え")
