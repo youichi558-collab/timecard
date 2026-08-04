@@ -266,9 +266,6 @@ def apply_dv_and_print(ws, anchor, last, s):
     dv.errorTitle = "時刻の入力"
     dv.error = ("コロンなしで 930（＝9時30分）のように入力してください。"
                 "9:30 のようにコロン付きでも入力できます。")
-    dv.promptTitle = "時刻の入力"
-    dv.prompt = "930 と入力すれば 09:30 になります"
-    dv.showInputMessage = True
     ws.add_data_validation(dv)
     for c in INPUT_COLS:
         col = get_column_letter(c)
