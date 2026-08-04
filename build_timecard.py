@@ -102,9 +102,13 @@ def to_serial(ref):
 
     コロンなしで 930 と入れた場合は 9時30分として換算し、コロン付きで 9:30 と
     入れた場合は Excel が時刻値(1未満)として持つのでそのまま使う。
+    日本語入力の全角コロン「9：00」は Excel が数値として認識できず文字列の
+    まま残るため、そのままだと無視されて計算に入らない。SUBSTITUTE で
+    半角コロンに直してから TIMEVALUE で読み直すことで、これも計算できるようにする。
     """
-    return (f'IF(NOT(ISNUMBER({ref})),"",'
-            f'IF({ref}<1,{ref},(INT({ref}/100)*60+MOD({ref},100))/1440))')
+    return (f'IF(ISNUMBER({ref}),'
+            f'IF({ref}<1,{ref},(INT({ref}/100)*60+MOD({ref},100))/1440),'
+            f'IFERROR(TIMEVALUE(SUBSTITUTE({ref},"：",":")),""))')
 
 
 def hhmm(t):
@@ -264,12 +268,14 @@ def apply_dv_and_print(ws, anchor, last, s):
     同じ処理でよい)。"""
     dv = DataValidation(
         type="custom", allow_blank=True, showErrorMessage=True,
-        formula1=f'=OR(AND(D{anchor}>=0,D{anchor}<1),'
-                 f'AND(D{anchor}=INT(D{anchor}),D{anchor}<=2359,'
-                 f'MOD(D{anchor},100)<60))')
+        formula1=f'=OR(AND(ISNUMBER(D{anchor}),D{anchor}>=0,D{anchor}<1),'
+                 f'AND(ISNUMBER(D{anchor}),D{anchor}=INT(D{anchor}),'
+                 f'D{anchor}<=2359,MOD(D{anchor},100)<60),'
+                 f'IFERROR(ISNUMBER(TIMEVALUE(SUBSTITUTE(D{anchor},'
+                 f'"：",":"))),FALSE))')
     dv.errorTitle = "時刻の入力"
     dv.error = ("コロンなしで 930（＝9時30分）のように入力してください。"
-                "9:30 のようにコロン付きでも入力できます。")
+                "9:30・9：00 のように半角/全角コロン付きでも入力できます。")
     ws.add_data_validation(dv)
     for c in INPUT_COLS:
         col = get_column_letter(c)
