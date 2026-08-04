@@ -12,29 +12,45 @@
 """
 
 import datetime
+import re
+import xml.etree.ElementTree as ET
+import zipfile
 from copy import copy
+from xml.sax.saxutils import escape
 
 from openpyxl import load_workbook
-from openpyxl.styles import Border
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.datavalidation import DataValidation
+
+# 数式セルの計算結果(キャッシュ値)。{シート名: {セル番地: 値}}
+# openpyxl は数式の文字列だけを保存し、計算済みの値は保存しない。そのため
+# Excel が開いて再計算するまで、日付などが一瞬空欄に見えることがある
+# (fullCalcOnLoad で通常は自動的に直るが、再計算しないビューアもある)。
+# ここでは自分で書いた数式の結果を Python側でも計算しておき、保存後に
+# セルのスタイルには一切触れずに <v> タグだけを差し込んで解消する。
+CACHE = {}
+
+
+def cache(ws, coord, value):
+    if value is not None:
+        CACHE.setdefault(ws.title, {})[coord] = value
 
 SRC = "出勤簿_2026_original.xlsx"
 DST = "出勤簿_2026.xlsx"
 YEAR = 2026
 
-# 元ブックの列構成(A〜K)は動かさない。右端に2列だけ足す。
+# 元ブックの列構成(A〜K)はそのまま。列の追加はしない。
 C_IN, C_OUT = 4, 6                            # D=出勤, F=退勤
 C_OT, C_OT_N, C_OT_E, C_LATE = 7, 8, 9, 10    # G〜J=各残業・遅刻早退
 C_REASON = 11                                 # K=理由
-C_BREAK, C_WORK = 12, 13                      # L=休憩, M=実働（追加）
-# N〜U は非表示の作業列。入力値のシリアル値変換と、曜日区分の判定に使う。
-C_CONV = {C_IN: 14, C_OUT: 15, C_BREAK: 16,
-          C_OT: 17, C_OT_N: 18, C_OT_E: 19, C_LATE: 20}
-C_KIND = 21
+# N〜T は非表示の作業列。入力値のシリアル値変換、日ごとの実働時間、
+# 曜日区分の判定に使う。集計はここを参照する（表には出さない）。
+C_CONV = {C_IN: 14, C_OUT: 15, C_OT: 16, C_OT_N: 17, C_OT_E: 18, C_LATE: 19}
+C_DAILY_WORK, C_KIND = 20, 21
 HIDDEN = range(14, 22)
 
-INPUT_COLS = [C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE, C_BREAK]
+INPUT_COLS = [C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE]
 COL_LABEL = {C_IN: "出勤", C_OUT: "退勤", C_OT: "通常残業", C_OT_N: "深夜残業",
              C_OT_E: "早朝残業", C_LATE: "遅刻・早退"}
 
@@ -85,20 +101,25 @@ def hhmm(t):
     return t.hour * 100 + t.minute
 
 
+WEEKDAY_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def days_in_month(month):
+    nxt = datetime.date(YEAR + month // 12, month % 12 + 1, 1)
+    return (nxt - datetime.timedelta(days=1)).day
+
+
+def frac(v):
+    """HHMM整数を、Excelの時刻シリアル値(1日=1)相当の小数に変換する。"""
+    return None if v is None else ((v // 100) * 60 + v % 100) / 1440
+
+
 def copy_style(dst, src):
     dst.font = copy(src.font)
     dst.border = copy(src.border)
     dst.fill = copy(src.fill)
     dst.alignment = copy(src.alignment)
     dst.number_format = src.number_format
-
-
-def with_right(border, style):
-    """右罫線だけ差し替えた罫線を返す。L・M列を足すぶん、K列の右端を内側の線にする。"""
-    right = copy(border.right)
-    right.style = style
-    return Border(left=copy(border.left), right=right,
-                  top=copy(border.top), bottom=copy(border.bottom))
 
 
 def find_row(ws, col, text, limit=60):
@@ -131,56 +152,77 @@ def fix_holidays(wb):
             ws.cell(r, c).value = None
 
     for i, ((m, d), name, memo) in enumerate(HOLIDAYS_2026, start=2):
-        vals = [datetime.date(YEAR, m, d),
-                f'=IF(A{i}="","",TEXT(A{i},"（aaa）"))', name, memo]
+        # 曜日はロケールに依存しない CHOOSE(WEEKDAY()) で組み立てる
+        # （TEXT(...,"aaa") だと、開いた環境の言語設定によって英語表記になりうる）
+        dow = (f'=IF(A{i}="","","（"&'
+               f'CHOOSE(WEEKDAY(A{i},2),"月","火","水","木","金","土","日")&"）")')
+        vals = [datetime.date(YEAR, m, d), dow, name, memo]
         for c, (v, st) in enumerate(zip(vals, styles), start=1):
             cell = ws.cell(i, c, v)
             (cell.font, cell.border, cell.fill,
              cell.alignment, cell.number_format) = st
+        wd = WEEKDAY_JA[datetime.date(YEAR, m, d).weekday()]
+        cache(ws, f"B{i}", f"（{wd}）")
     return len(HOLIDAYS_2026)
 
 
 def fix_month(ws, name):
     anchor = find_anchor(ws)
     last = anchor + 30
+    month = int(ws.title[:-1])
+    ndays = days_in_month(month)
+    holidays = {datetime.date(YEAR, m, d): nm for (m, d), nm, _ in HOLIDAYS_2026}
     salvaged = []
+    count_in = 0
+    work_sum = sat_work_sum = ot_sum = 0.0
 
     # --- 氏名。元ブックでは月ごとに手入力で、未記入や㊞のままの月があった ---
     if ws.cell(2, C_REASON).value in (None, "", "㊞"):
         ws.cell(2, C_REASON, name)
 
-    # --- 追加する2列の見出し。書式は隣の列から借りて元の体裁に合わせる ---
+    # --- 見出し。4月だけ K列が「休憩時間」になっていたので他の月にそろえる ---
     head = anchor - 1
-    copy_style(ws.cell(head, C_BREAK), ws.cell(head, C_LATE))
-    copy_style(ws.cell(head, C_WORK), ws.cell(head, C_REASON))
-    ws.cell(head, C_REASON).border = with_right(ws.cell(head, C_REASON).border, "thin")
-    ws.cell(head, C_REASON, "理由")   # 4月だけ「休憩時間」になっていた
-    ws.cell(head, C_BREAK, "休憩")
-    ws.cell(head, C_WORK, "実働")
+    if ws.cell(head, C_REASON).value != "理由":
+        ws.cell(head, C_REASON, "理由")
 
     for r in range(anchor, last + 1):
-        # 曜日欄。4月の1日目だけ数式でなく文字が直接入っていた
-        ws.cell(r, 3, f'=IF(A{r}="","","("&TEXT(A{r},"aaa")&"）")')
+        day = r - anchor + 1
+        date_val = datetime.date(YEAR, month, day) if day <= ndays else None
+
+        # 曜日欄。4月の1日目だけ数式でなく文字が直接入っていた。
+        # ロケール非依存の CHOOSE(WEEKDAY()) にして、TEXT(...,"aaa") が環境の
+        # 言語設定で英語表記になってしまう問題も合わせて防ぐ。
+        ws.cell(r, 3,
+                f'=IF(A{r}="","","("&'
+                f'CHOOSE(WEEKDAY(A{r},2),"月","火","水","木","金","土","日")&"）")')
+        cache(ws, f"A{r}", to_excel(date_val) if date_val else None)
+        if date_val:
+            cache(ws, f"C{r}", f"({WEEKDAY_JA[date_val.weekday()]}）")
 
         # 入力欄。時刻値は HHMM の数値に直し、「：」などの飾り文字は消す
+        vals = {}
         for c in (C_IN, C_OUT, C_OT, C_OT_N, C_OT_E, C_LATE):
             cell = ws.cell(r, c)
             v = cell.value
             if isinstance(v, datetime.time):
-                cell.value = hhmm(v)
+                v = hhmm(v)
+                cell.value = v
             elif v is not None:
                 if isinstance(v, str) and v.strip() and v.strip() not in JUNK:
-                    salvaged.append((r - anchor + 1, cell.coordinate,
+                    salvaged.append((day, cell.coordinate,
                                      f"{COL_LABEL[c]}「{v.strip()}」"))
+                v = None
                 cell.value = None
             cell.number_format = TIME_FMT
+            vals[c] = v
 
         # 理由欄。祝日名は自動表示に戻し、手書きのメモはそのまま残す
         k = ws.cell(r, C_REASON)
         keep = (isinstance(k.value, str) and k.value.strip()
                 and not k.value.startswith("=")
                 and k.value.strip() not in HOLIDAY_NAMES)
-        row_bad = [s for d, _, s in salvaged if d == r - anchor + 1]
+        row_bad = [s for d, _, s in salvaged if d == day]
+        holiday_name = holidays.get(date_val)
         if row_bad:
             # 時刻として読めなかった入力は消したままにせず、理由欄に退避する
             flag = "要確認: " + "・".join(row_bad)
@@ -188,41 +230,54 @@ def fix_month(ws, name):
         elif not keep:
             k.value = (f'=IF($A{r}="","",'
                        f'IFERROR(VLOOKUP($A{r},祝日リスト!$A$2:$C$40,3,0),""))')
-        k.border = with_right(k.border, "thin")
+            cache(ws, f"K{r}", holiday_name)
 
-        # 追加2列。書式は隣の列から借りる
-        copy_style(ws.cell(r, C_BREAK), ws.cell(r, C_LATE))
-        copy_style(ws.cell(r, C_WORK), ws.cell(r, C_REASON))
-        ws.cell(r, C_BREAK).number_format = TIME_FMT
-        ws.cell(r, C_WORK).number_format = "[h]:mm"
-        ws.cell(r, C_WORK).value = (
-            f'=IF(OR($N{r}="",$O{r}=""),"",'
-            f'MAX(0,MOD($O{r}-$N{r},1)-IF($P{r}<>"",$P{r},0)))')
-
-        # 作業列。元ブックに残っていた余計な数式もここで上書きされて消える
+        # 非表示の作業列。入力値のシリアル値変換、日ごとの実働、曜日区分。
+        # 表には出さず、集計だけがここを参照する。
         for src, dst in C_CONV.items():
             ws.cell(r, dst, "=" + to_serial(f"${get_column_letter(src)}{r}"))
+        ws.cell(r, C_DAILY_WORK,
+                f'=IF(OR($N{r}="",$O{r}=""),"",MOD($O{r}-$N{r},1))')
         ws.cell(r, C_KIND,
                 f'=IF($A{r}="","",IF($K{r}<>"","祝",'
                 f'IF(WEEKDAY($A{r},2)=6,"土",IF(WEEKDAY($A{r},2)=7,"日","平"))))')
         for c in range(C_KIND + 1, 30):         # 作業列より右の残骸を掃除
             ws.cell(r, c).value = None
 
+        # 集計欄のキャッシュ値を作るため、この行の実働・残業を集計しておく
+        in_f, out_f = frac(vals[C_IN]), frac(vals[C_OUT])
+        work_f = None if in_f is None or out_f is None else (out_f - in_f) % 1
+        if date_val and vals[C_IN] is not None:
+            count_in += 1
+        if work_f is not None:
+            work_sum += work_f
+            if date_val and holiday_name is None and date_val.weekday() == 5:
+                sat_work_sum += work_f
+        for c in (C_OT, C_OT_N, C_OT_E):
+            fv = frac(vals[c])
+            if fv is not None:
+                ot_sum += fv
+
     # --- 集計。行の位置と見出しは元のまま、式だけ実績ベースに直す ---
     s = find_row(ws, 3, "出勤日数")
-    work = f"$M${anchor}:$M${last}"
+    work = f"$T${anchor}:$T${last}"
     kind = f"$U${anchor}:$U${last}"
     for i in range(1, 4):                        # 元は空欄だった行の書式をそろえる
         copy_style(ws.cell(s + i, 4), ws.cell(s, 4))
     ws.cell(s, 4, f"=COUNT($N${anchor}:$N${last})").number_format = "0"
+    cache(ws, ws.cell(s, 4).coordinate, count_in)
     ws.cell(s + 1, 4, f'=SUM({work})-SUMIF({kind},"土",{work})')
+    cache(ws, ws.cell(s + 1, 4).coordinate, work_sum - sat_work_sum)
     ws.cell(s + 2, 4,
-            f"=SUM($Q${anchor}:$Q${last})+SUM($R${anchor}:$R${last})"
-            f"+SUM($S${anchor}:$S${last})")
+            f"=SUM($P${anchor}:$P${last})+SUM($Q${anchor}:$Q${last})"
+            f"+SUM($R${anchor}:$R${last})")
+    cache(ws, ws.cell(s + 2, 4).coordinate, ot_sum)
     ws.cell(s + 3, 4, f'=SUMIF({kind},"土",{work})')
+    cache(ws, ws.cell(s + 3, 4).coordinate, sat_work_sum)
     for i in range(1, 4):
         ws.cell(s + i, 4).number_format = "[h]:mm"
     ws.cell(s + 3, 10, f"=SUM({work})").number_format = "[h]:mm"
+    cache(ws, ws.cell(s + 3, 10).coordinate, work_sum)
 
     # --- 入力規則。コロンなしとコロン付きの両方を通す ---
     dv = DataValidation(
@@ -241,15 +296,80 @@ def fix_month(ws, name):
         col = get_column_letter(c)
         dv.add(f"{col}{anchor}:{col}{last}")
 
-    # --- 表示・印刷。元の設定に追加2列ぶんだけ足す ---
+    # --- 表示・印刷。列構成は元のまま。作業列(N〜U)だけ隠す ---
     for c in HIDDEN:
         ws.column_dimensions[get_column_letter(c)].hidden = True
-    ws.column_dimensions["L"].width = 9.0
-    ws.column_dimensions["L"].hidden = False
-    ws.column_dimensions["M"].width = 10.0
-    ws.column_dimensions["M"].hidden = False
-    ws.print_area = f"A1:M{s + 3}"
     return salvaged
+
+
+NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+NS_PREL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def fmt_value(v):
+    """CACHE の値を <v> タグの中身にする。文字列かどうかも一緒に返す。"""
+    if isinstance(v, str):
+        return True, escape(v)
+    if isinstance(v, float) and v.is_integer():
+        return False, str(int(v))
+    if isinstance(v, int):
+        return False, str(v)
+    return False, ("%.10f" % v).rstrip("0").rstrip(".")
+
+
+def sheet_file_map(data):
+    """シート名 → xl/worksheets/sheetN.xml のパスを workbook.xml から求める。"""
+    wb_xml = ET.fromstring(data["xl/workbook.xml"])
+    rels = ET.fromstring(data["xl/_rels/workbook.xml.rels"])
+    rid_target = {rel.get("Id"): rel.get("Target")
+                  for rel in rels.findall(f"{NS_PREL}Relationship")}
+    mapping = {}
+    for sheet in wb_xml.find(f"{NS_MAIN}sheets").findall(f"{NS_MAIN}sheet"):
+        target = rid_target[sheet.get(f"{NS_R}id")]
+        if not target.startswith("worksheets/"):
+            target = "worksheets/" + target.rsplit("/", 1)[-1]
+        mapping[sheet.get("name")] = "xl/" + target
+    return mapping
+
+
+def patch_sheet_xml(xml_text, cell_cache):
+    for coord, value in cell_cache.items():
+        is_str, text = fmt_value(value)
+        m = re.search(rf'(<c r="{re.escape(coord)}"[^>]*>)(.*?)(</c>)',
+                       xml_text, re.S)
+        if not m:
+            continue
+        open_tag, inner, close_tag = m.groups()
+        if is_str:
+            open_tag = (re.sub(r' t="[^"]*"', ' t="str"', open_tag)
+                        if ' t="' in open_tag else open_tag[:-1] + ' t="str">')
+        inner = re.sub(r"<v\s*/>|<v>.*?</v>", "", inner, flags=re.S) + f"<v>{text}</v>"
+        xml_text = xml_text[:m.start()] + open_tag + inner + close_tag + xml_text[m.end():]
+    return xml_text
+
+
+def inject_cache(path):
+    """保存済みファイルに、数式の計算結果(CACHE)だけを直接書き込む。
+
+    openpyxl のスタイル出力には一切触れない。<c> タグの中身に <v> を足すだけの
+    XML パッチなので、見た目(フォント・罫線・列幅など)は完全にそのまま保たれる。
+    """
+    if not CACHE:
+        return
+    with zipfile.ZipFile(path, "r") as zin:
+        names = zin.namelist()
+        data = {n: zin.read(n) for n in names}
+    mapping = sheet_file_map(data)
+    for sheet, cell_cache in CACHE.items():
+        file = mapping.get(sheet)
+        if not file:
+            continue
+        data[file] = patch_sheet_xml(data[file].decode("utf-8"),
+                                      cell_cache).encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for n in names:
+            zout.writestr(n, data[n])
 
 
 def main():
@@ -270,6 +390,7 @@ def main():
             print(f"  要確認 {m}月{day}日 {addr} = {v!r}（時刻として読めないため削除）")
 
     wb.save(DST)
+    inject_cache(DST)
     print(f"saved {DST}: {wb.sheetnames}")
 
 
