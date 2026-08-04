@@ -28,7 +28,9 @@ from openpyxl.utils.datetime import to_excel
 from openpyxl.worksheet.datavalidation import DataValidation
 
 # 土日・水曜・祝日をこの色で塗る(休日として同じ色でまとめる)
-HOLIDAY_FILL = PatternFill("solid", fgColor="FFFFC7CE")
+# 条件付き書式のdxfは、通常のセルと違いbgColor側に色を入れないと
+# Excel実機では表示されない(fgColorだけだとLibreOfficeは表示するがExcelは無視する)。
+HOLIDAY_FILL = PatternFill("solid", fgColor="FFFFC7CE", bgColor="FFFFC7CE")
 
 # 数式セルの計算結果(キャッシュ値)。{シート名: {セル番地: 値}}
 # openpyxl は数式の文字列だけを保存し、計算済みの値は保存しない。そのため
