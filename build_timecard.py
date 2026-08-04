@@ -411,6 +411,7 @@ def inject_cache(path):
 
 TEMPLATE_MONTH = 1  # このシートの体裁を12か月ぶん複製する
 HIRE_DATE = datetime.date(2026, 4, 15)  # 入社日。これより前のデータは使わない
+RESET_MONTHS = {7}  # 入社日以降でも、一旦データをリセットする月
 
 
 def main():
@@ -431,7 +432,7 @@ def main():
         ws = wb[f"{m}月"]
         anchor = find_anchor(ws)
         records = extract_month_records(ws, anchor, days_in_month(m))
-        month_records[m] = {
+        month_records[m] = {} if m in RESET_MONTHS else {
             day: rec for day, rec in records.items()
             if datetime.date(YEAR, m, day) >= HIRE_DATE
         }
